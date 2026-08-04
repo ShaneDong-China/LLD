@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS project_devices (
     template_id INTEGER,
     name TEXT NOT NULL,
     location TEXT,
+    sort_order INTEGER,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY (template_id) REFERENCES device_templates(id)
 );
@@ -67,11 +68,16 @@ CREATE TABLE IF NOT EXISTS project_connections (
     port_b_id INTEGER NOT NULL,
     aggregation_group_a TEXT,
     aggregation_group_b TEXT,
-    aggregation_mode TEXT,
-    interface_mode TEXT,
-    vlan_id TEXT,
-    description TEXT,
-    note TEXT,
+    aggregation_mode_a TEXT,
+    aggregation_mode_b TEXT,
+    interface_mode_a TEXT,
+    interface_mode_b TEXT,
+    vlan_id_a TEXT,
+    vlan_id_b TEXT,
+    description_a TEXT,
+    description_b TEXT,
+    note_a TEXT,
+    note_b TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY (port_a_id) REFERENCES project_ports(id),
@@ -97,6 +103,12 @@ CREATE TABLE IF NOT EXISTS project_vlans (
     sort_order INTEGER DEFAULT 0,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     UNIQUE(project_id, value)
+);
+
+-- 10. 应用设置（键值对，如线缆标签格式 / 设备标签勾选列）
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 """
 
@@ -265,6 +277,113 @@ def _migrate_drop_port_fields(conn):
     return True
 
 
+def _migrate_split_desc_note(conn):
+    """连接描述/备注按端拆分：description/note 单列拆成 _a/_b 两列，旧值归本端。
+    幂等：project_connections 已有 description_a 列则跳过。"""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(project_connections)')}
+    if 'description_a' in cols:
+        return False
+    conn.commit()  # 提交未决事务，否则 PRAGMA foreign_keys 在事务内无效
+    conn.execute('PRAGMA foreign_keys = OFF')
+    try:
+        conn.executescript('''
+            DROP TABLE IF EXISTS project_connections_new;
+            CREATE TABLE project_connections_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                port_a_id INTEGER NOT NULL,
+                port_b_id INTEGER NOT NULL,
+                aggregation_group_a TEXT,
+                aggregation_group_b TEXT,
+                aggregation_mode TEXT,
+                interface_mode TEXT,
+                vlan_id TEXT,
+                description_a TEXT,
+                description_b TEXT,
+                note_a TEXT,
+                note_b TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (port_a_id) REFERENCES project_ports(id),
+                FOREIGN KEY (port_b_id) REFERENCES project_ports(id),
+                UNIQUE(port_a_id, port_b_id)
+            );
+            INSERT INTO project_connections_new
+                (id, project_id, port_a_id, port_b_id, aggregation_group_a, aggregation_group_b,
+                 aggregation_mode, interface_mode, vlan_id,
+                 description_a, description_b, note_a, note_b, created_at)
+                SELECT id, project_id, port_a_id, port_b_id, aggregation_group_a, aggregation_group_b,
+                       aggregation_mode, interface_mode, vlan_id,
+                       description, NULL, note, NULL, created_at
+                FROM project_connections;
+            DROP TABLE project_connections;
+            ALTER TABLE project_connections_new RENAME TO project_connections;
+        ''')
+    finally:
+        conn.execute('PRAGMA foreign_keys = ON')
+    return True
+
+
+def _migrate_split_common_params(conn):
+    """聚合模式/接口模式/VLAN 按端拆分：单列拆成 _a/_b，旧值两端复制（拆分前左右显示同一值）。
+    幂等：project_connections 已有 aggregation_mode_a 列则跳过。"""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(project_connections)')}
+    if 'aggregation_mode_a' in cols:
+        return False
+    conn.commit()  # 提交未决事务，否则 PRAGMA foreign_keys 在事务内无效
+    conn.execute('PRAGMA foreign_keys = OFF')
+    try:
+        conn.executescript('''
+            DROP TABLE IF EXISTS project_connections_new;
+            CREATE TABLE project_connections_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                port_a_id INTEGER NOT NULL,
+                port_b_id INTEGER NOT NULL,
+                aggregation_group_a TEXT,
+                aggregation_group_b TEXT,
+                aggregation_mode_a TEXT,
+                aggregation_mode_b TEXT,
+                interface_mode_a TEXT,
+                interface_mode_b TEXT,
+                vlan_id_a TEXT,
+                vlan_id_b TEXT,
+                description_a TEXT,
+                description_b TEXT,
+                note_a TEXT,
+                note_b TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (port_a_id) REFERENCES project_ports(id),
+                FOREIGN KEY (port_b_id) REFERENCES project_ports(id),
+                UNIQUE(port_a_id, port_b_id)
+            );
+            INSERT INTO project_connections_new
+                (id, project_id, port_a_id, port_b_id, aggregation_group_a, aggregation_group_b,
+                 aggregation_mode_a, aggregation_mode_b, interface_mode_a, interface_mode_b,
+                 vlan_id_a, vlan_id_b, description_a, description_b, note_a, note_b, created_at)
+                SELECT id, project_id, port_a_id, port_b_id, aggregation_group_a, aggregation_group_b,
+                       aggregation_mode, aggregation_mode, interface_mode, interface_mode,
+                       vlan_id, vlan_id, description_a, description_b, note_a, note_b, created_at
+                FROM project_connections;
+            DROP TABLE project_connections;
+            ALTER TABLE project_connections_new RENAME TO project_connections;
+        ''')
+    finally:
+        conn.execute('PRAGMA foreign_keys = ON')
+    return True
+
+
+def _migrate_device_sort_order(conn):
+    """设备排序：project_devices 加 sort_order 列，初始按 id 顺序填充。幂等。"""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(project_devices)')}
+    if 'sort_order' in cols:
+        return False
+    conn.execute('ALTER TABLE project_devices ADD COLUMN sort_order INTEGER')
+    conn.execute('UPDATE project_devices SET sort_order = id')
+    return True
+
+
 def _migrate_drop_device_role(conn):
     """设备角色删除：清空 device_role 字典，重建 project_devices 去掉 role 列。幂等。"""
     conn.execute("DELETE FROM option_dicts WHERE category = 'device_role'")
@@ -294,6 +413,16 @@ def _migrate_drop_device_role(conn):
     return True
 
 
+def _migrate_device_ip_fields(conn):
+    """设备管理 IP / BMC IP：project_devices 加两列。幂等。"""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(project_devices)')}
+    if 'management_ip' in cols:
+        return False
+    conn.execute('ALTER TABLE project_devices ADD COLUMN management_ip TEXT')
+    conn.execute('ALTER TABLE project_devices ADD COLUMN bmc_ip TEXT')
+    return True
+
+
 def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
     # 只在数据库首次创建时导入种子数据；之后以用户数据为准
@@ -312,6 +441,14 @@ def init_db():
             print('已删除端口附加字段（槽位/类型/速率/介质）')
         if _migrate_drop_device_role(conn):
             print('已删除设备角色字段')
+        if _migrate_device_sort_order(conn):
+            print('已添加设备排序字段（按当前顺序初始化）')
+        if _migrate_split_desc_note(conn):
+            print('已拆分连接描述/备注为按端存储（旧值归本端）')
+        if _migrate_split_common_params(conn):
+            print('已拆分聚合模式/接口模式/VLAN 为按端存储（旧值两端复制）')
+        if _migrate_device_ip_fields(conn):
+            print('已添加设备管理 IP / BMC IP 字段')
         if is_new:
             seed_templates(conn)
             seed_dicts(conn)

@@ -16,7 +16,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-from .db_utils import get_conn
+from .db_utils import get_conn, query_all
 from .template_utils import list_templates, list_ports, type_label
 from .export_utils import _safe_sheet_name
 from .import_utils import guess_port_attrs
@@ -126,7 +126,7 @@ def _read_info_sheet(source):
 
 def _parse_library_sheets(source):
     """解析模板库端口 sheet（简单格式：仅「接口」列，端口名原样记录）。
-    返回 (templates: {型号: [端口名]}, skipped: [str])
+    返回 (templates: {型号: [端口名]}, skipped: [{'name', 'reason'}])
     """
     templates = {}
     skipped = []
@@ -137,7 +137,7 @@ def _parse_library_sheets(source):
                 continue
             rows = list(ws.iter_rows(values_only=True))
             if not rows:
-                skipped.append(ws.title)
+                skipped.append({'name': ws.title, 'reason': '空 sheet（无数据）'})
                 continue
             # 找表头行（前 5 行内含「接口」列）
             header_row = None
@@ -147,7 +147,7 @@ def _parse_library_sheets(source):
                     header_row = i
                     break
             if header_row is None:
-                skipped.append(f"{ws.title}（未找到「接口」表头）")
+                skipped.append({'name': ws.title, 'reason': '未找到「接口」表头'})
                 continue
 
             def col_idx(keys):
@@ -159,7 +159,7 @@ def _parse_library_sheets(source):
 
             col_iface = col_idx(COL_KEYS['接口'])
             if col_iface is None:
-                skipped.append(f"{ws.title}（未找到「接口」表头）")
+                skipped.append({'name': ws.title, 'reason': '未找到「接口」表头'})
                 continue
 
             ports = []
@@ -175,60 +175,69 @@ def _parse_library_sheets(source):
     return templates, skipped
 
 
-def preview_templates(source):
-    """解析工作簿供界面预览（严格模式）。
-    返回 (models: {型号: 端口数}, skipped: [str], undefined: [未在信息表定义的型号])
+def classify_templates(source):
+    """解析并分类模板库文件（预览与导入共用同一分类标准，保证显示与实际一致）。
+    返回 {'importable': [{'model', 'ports', 'vendor', 'type', 'description'}],
+          'skipped': [{'name', 'reason'}]}
+    跳过原因（严格模式）：
+    - 库中已存在（不覆盖）
+    - 模板信息表中未定义 / 类型无效
+    - 格式问题（空 sheet / 未找到「接口」表头）
+    - 模板信息表已定义但文件无对应 sheet
     """
     if hasattr(source, 'seek'):
         source.seek(0)
     meta = _read_info_sheet(source)
     if hasattr(source, 'seek'):
         source.seek(0)
-    templates, skipped = _parse_library_sheets(source)
-    models = {m: len(p) for m, p in templates.items()}
-    undefined = [m for m in templates if m not in meta]
-    return models, skipped, undefined
+    templates, fmt_skipped = _parse_library_sheets(source)
+    existing = {r['model'] for r in query_all('SELECT model FROM device_templates')}
+
+    importable, skipped = [], list(fmt_skipped)
+    for model, ports in templates.items():
+        if not model:
+            skipped.append({'name': '（无型号 sheet）', 'reason': 'sheet 名为空'})
+            continue
+        if model in existing:
+            skipped.append({'name': model, 'reason': '库中已存在（不覆盖）'})
+            continue
+        info = meta.get(model)
+        if not info:
+            skipped.append({'name': model, 'reason': '模板信息表中未定义'})
+            continue
+        if not info.get('type'):
+            skipped.append({'name': model, 'reason': '模板信息表中类型无效（需为 网络设备/服务器/其它设备）'})
+            continue
+        importable.append({
+            'model': model, 'ports': ports,
+            'vendor': info.get('vendor', ''),
+            'type': info.get('type', ''),
+            'description': info.get('description', ''),
+        })
+    # 信息表已定义但文件里没有对应 sheet 的型号（文件可能漏了该 sheet）
+    for model in meta:
+        if model not in templates:
+            skipped.append({'name': model, 'reason': '模板信息表已定义但文件无对应 sheet'})
+    return {'importable': importable, 'skipped': skipped}
 
 
 def import_templates(source):
     """从模板库 Excel 导入模板（严格模式，单事务，失败自动回滚）。
-    型号 = sheet 名，必须已在「模板信息」表中定义且类型有效，否则校验提醒并跳过；
-    已存在则跳过（不覆盖不扩充）。返回摘要 dict。
-    """
-    if hasattr(source, 'seek'):
-        source.seek(0)
-    meta = _read_info_sheet(source)
-    templates, skipped = _parse_library_sheets(source)
+    分类标准与 classify_templates 完全一致：只导入可导入项，其余跳过。返回摘要 dict。"""
+    result = classify_templates(source)
     created = []
     port_total = 0
     with closing(get_conn()) as conn, conn:
-        for model, ports in templates.items():
-            if not model:
-                skipped.append('（无型号 sheet）')
-                continue
-            existing = conn.execute(
-                'SELECT id FROM device_templates WHERE model = ?', (model,)).fetchone()
-            if existing:
-                skipped.append(model)
-                continue
-            info = meta.get(model)
-            if not info:
-                skipped.append(f'{model}（模板信息表中未定义，已跳过）')
-                continue
-            type_ = info.get('type')
-            if not type_:
-                skipped.append(f'{model}（模板信息表中类型无效，已跳过）')
-                continue
+        for t in result['importable']:
             cur = conn.execute(
                 'INSERT INTO device_templates (model, vendor, type, description) VALUES (?,?,?,?)',
-                (model, info.get('vendor', ''), type_, info.get('description', '')))
+                (t['model'], t['vendor'], t['type'], t['description']))
             tpl_id = cur.lastrowid
-
             # 端口：端口名即完整接口名（Slot2_Fi_10GE_41 原样记录）
-            for port_name in ports:
+            for port_name in t['ports']:
                 conn.execute(
                     'INSERT INTO port_templates (device_template_id, port_name) VALUES (?,?)',
                     (tpl_id, port_name))
                 port_total += 1
-            created.append(model)
-    return {'created': created, 'skipped': skipped, 'port_count': port_total}
+            created.append(t['model'])
+    return {'created': created, 'skipped': result['skipped'], 'port_count': port_total}

@@ -319,19 +319,24 @@ def import_workbook(source, project_name='', include_other=False):
             remote_id = resolve_port(r['remote_device'], r['remote_port'], is_remote=True)
             port_a, port_b = sorted((local_id, remote_id))
 
-            # 聚合组归属：本行是本端视角，聚合组写到本端
+            # 聚合组/聚合模式/接口模式/VLAN/描述/备注归属：本行是本端视角，本端值写到本端列（两端各自保留）
             agg_a, agg_b = (r['agg'], '') if port_a == local_id else ('', r['agg'])
+            agg_mode_a, agg_mode_b = (r['agg_mode'], '') if port_a == local_id else ('', r['agg_mode'])
+            if_mode_a, if_mode_b = (r['if_mode'], '') if port_a == local_id else ('', r['if_mode'])
+            vlan_a, vlan_b = (r['vlan'], '') if port_a == local_id else ('', r['vlan'])
+            desc_a, desc_b = (r['description'], '') if port_a == local_id else ('', r['description'])
+            note_a, note_b = (r['note'], '') if port_a == local_id else ('', r['note'])
 
-            # 字典 / VLAN 自动扩充
+            # 字典 / VLAN 自动扩充（'/' 表示无，不进字典）
             for cat, val in (('aggregation_mode', r['agg_mode']), ('interface_mode', r['if_mode'])):
-                if val:
+                if val and val != '/':
                     row = conn.execute('SELECT id FROM option_dicts WHERE category=? AND value=?', (cat, val)).fetchone()
                     if not row:
                         conn.execute('INSERT INTO option_dicts (category, value, sort_order) VALUES (?,?,'
                                      '(SELECT COALESCE(MAX(sort_order),0)+1 FROM option_dicts WHERE category=?))',
                                      (cat, val, cat))
                         dict_added.append(f"{cat}:{val}")
-            if r['status'] and r['status'] not in ('Down', 'UP'):
+            if r['status'] and r['status'] not in ('Down', 'UP') and r['status'] != '/':
                 row = conn.execute('SELECT id FROM option_dicts WHERE category=? AND value=?',
                                    ('interface_status', r['status'])).fetchone()
                 if not row:
@@ -340,7 +345,7 @@ def import_workbook(source, project_name='', include_other=False):
                                  ('interface_status', r['status'], 'interface_status'))
                     dict_added.append(f"interface_status:{r['status']}")
             for v in re.split(r'[\s,、]+', r['vlan']):
-                if v:
+                if v and v != '/':
                     row = conn.execute('SELECT id FROM project_vlans WHERE project_id=? AND value=?',
                                        (project_id, v)).fetchone()
                     if not row:
@@ -350,13 +355,16 @@ def import_workbook(source, project_name='', include_other=False):
                         vlan_added.append(v)
 
             if (port_a, port_b) in link_map:
-                # 镜像行：补齐对端聚合组与空缺字段
+                # 镜像行：补齐对端聚合组与空缺字段（各参数按端补，两端不互相覆盖）
                 cid = link_map[(port_a, port_b)]
                 cur = conn.execute('SELECT * FROM project_connections WHERE id = ?', (cid,)).fetchone()
                 sets, params = [], []
                 for col, val in [('aggregation_group_a', agg_a), ('aggregation_group_b', agg_b),
-                                 ('aggregation_mode', r['agg_mode']), ('interface_mode', r['if_mode']),
-                                 ('vlan_id', r['vlan']), ('description', r['description']), ('note', r['note'])]:
+                                 ('aggregation_mode_a', agg_mode_a), ('aggregation_mode_b', agg_mode_b),
+                                 ('interface_mode_a', if_mode_a), ('interface_mode_b', if_mode_b),
+                                 ('vlan_id_a', vlan_a), ('vlan_id_b', vlan_b),
+                                 ('description_a', desc_a), ('description_b', desc_b),
+                                 ('note_a', note_a), ('note_b', note_b)]:
                     if val and not cur[col]:
                         sets.append(f'{col} = ?')
                         params.append(val)
@@ -368,11 +376,16 @@ def import_workbook(source, project_name='', include_other=False):
             cur = conn.execute('''
                 INSERT INTO project_connections
                     (project_id, port_a_id, port_b_id, aggregation_group_a, aggregation_group_b,
-                     aggregation_mode, interface_mode, vlan_id, description, note)
-                VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                     aggregation_mode_a, aggregation_mode_b,
+                     interface_mode_a, interface_mode_b,
+                     vlan_id_a, vlan_id_b,
+                     description_a, description_b, note_a, note_b)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (project_id, port_a, port_b, agg_a or None, agg_b or None,
-                 r['agg_mode'] or None, r['if_mode'] or None, r['vlan'] or None,
-                 r['description'] or None, r['note'] or None))
+                 agg_mode_a or None, agg_mode_b or None,
+                 if_mode_a or None, if_mode_b or None,
+                 vlan_a or None, vlan_b or None,
+                 desc_a or None, desc_b or None, note_a or None, note_b or None))
             link_map[(port_a, port_b)] = cur.lastrowid
             conn_created += 1
 

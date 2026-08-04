@@ -2,7 +2,7 @@
 """项目管理：项目 / 设备实例 / 端口克隆 / 端口状态"""
 from contextlib import closing
 
-from .db_utils import get_conn, query_all, query_one, execute
+from .db_utils import get_conn, query_all, query_one, execute, natural_key
 from .template_utils import get_template
 
 
@@ -60,24 +60,36 @@ def delete_project(project_id):
     execute('DELETE FROM projects WHERE id = ?', (project_id,))
 
 
+def split_agg_values(raw, n):
+    """批量连线本端聚合组拆分：空→全部空；1 个值→套全部；N 个值（空格分隔）→逐口对应。
+    数量不符（≠1 且 ≠N）抛 ValueError。"""
+    parts = raw.split()
+    if len(parts) <= 1:
+        return [parts[0] if parts else ''] * n
+    if len(parts) != n:
+        raise ValueError(f'聚合组填了 {len(parts)} 个值，需 1 个（全部相同）或 {n} 个（逐口对应）')
+    return parts
+
+
 def get_project_devices(project_id):
-    """项目内全部设备（含模板型号/类型）"""
+    """项目内全部设备（含模板型号/类型），按手动排序（sort_order），新设备排在末尾"""
     return query_all('''
         SELECT d.*, t.model, t.type AS template_type, t.vendor
         FROM project_devices d
         LEFT JOIN device_templates t ON t.id = d.template_id
-        WHERE d.project_id = ? ORDER BY d.id''', (project_id,))
+        WHERE d.project_id = ? ORDER BY COALESCE(d.sort_order, d.id)''', (project_id,))
 
 
-def add_project_device(project_id, template_id, name, location=''):
+def add_project_device(project_id, template_id, name, location='', mgmt_ip='', bmc_ip=''):
     """向已有项目添加设备并克隆端口，返回设备 id；设备名重复时抛 ValueError"""
     if query_one('SELECT id FROM project_devices WHERE project_id=? AND name=?',
                  (project_id, name)):
         raise ValueError(f'项目内已存在设备 "{name}"')
     with closing(get_conn()) as conn, conn:
         cur = conn.execute(
-            'INSERT INTO project_devices (project_id, template_id, name, location) VALUES (?,?,?,?)',
-            (project_id, template_id, name, location))
+            'INSERT INTO project_devices (project_id, template_id, name, location, management_ip, bmc_ip) '
+            'VALUES (?,?,?,?,?,?)',
+            (project_id, template_id, name, location, mgmt_ip, bmc_ip))
         dev_id = cur.lastrowid
         if template_id is not None:
             conn.execute('''
@@ -86,6 +98,27 @@ def add_project_device(project_id, template_id, name, location=''):
                 WHERE device_template_id = ? ORDER BY id''',
                 (dev_id, template_id))
     return dev_id
+
+
+def update_project_device(device_id, name, location='', mgmt_ip='', bmc_ip=''):
+    """更新设备名称/位置/管理 IP/BMC IP；同项目内设备名重复时抛 ValueError"""
+    dev = query_one('SELECT * FROM project_devices WHERE id = ?', (device_id,))
+    if not dev:
+        raise ValueError(f'设备不存在（id={device_id}）')
+    if query_one('SELECT id FROM project_devices WHERE project_id=? AND name=? AND id != ?',
+                 (dev['project_id'], name, device_id)):
+        raise ValueError(f'项目内已存在设备 "{name}"')
+    execute('UPDATE project_devices SET name = ?, location = ?, management_ip = ?, bmc_ip = ? WHERE id = ?',
+            (name, location, mgmt_ip, bmc_ip, device_id))
+
+
+def reorder_project_devices(project_id, ordered_ids):
+    """按给定设备 id 顺序重写排序号（sort_order = 0,1,2...）。
+    ordered_ids 应为该项目全部设备 id（新设备 sort_order 为 NULL 自动排最后）。"""
+    with closing(get_conn()) as conn, conn:
+        for i, dev_id in enumerate(ordered_ids):
+            conn.execute('UPDATE project_devices SET sort_order = ? WHERE id = ? AND project_id = ?',
+                         (i, dev_id, project_id))
 
 
 def delete_project_device(device_id):
@@ -102,6 +135,22 @@ def delete_project_device(device_id):
                 EXISTS(SELECT 1 FROM project_connections c
                        WHERE c.port_a_id = project_ports.id OR c.port_b_id = project_ports.id)''')
         conn.execute('DELETE FROM project_devices WHERE id = ?', (device_id,))
+
+
+def common_device_ports(project_id, dev_names):
+    """所选设备共同拥有**且未占用**的端口名（模板端口 + 自由端口实例的交集），自然序。
+    批量连线 A 模式的对端固定端口下拉用——只列空闲端口，选出来即可直接连线。"""
+    common = None
+    for name in dev_names:
+        d = query_one('SELECT * FROM project_devices WHERE project_id=? AND name=?',
+                      (project_id, name))
+        if not d:
+            continue
+        port_set = {r['port_name'] for r in query_all(
+            'SELECT port_name FROM project_ports WHERE project_device_id=? AND is_used = 0',
+            (d['id'],))}
+        common = port_set if common is None else common & port_set
+    return sorted(common or [], key=natural_key)
 
 
 def get_device_ports(device_id):
@@ -219,3 +268,17 @@ def add_project_vlan(project_id, value, name=''):
 
 def delete_project_vlan(vlan_id):
     execute('DELETE FROM project_vlans WHERE id = ?', (vlan_id,))
+
+
+# ---------------- 应用设置（键值对，如线缆标签格式 / 设备标签勾选列） ----------------
+
+def get_setting(key, default=''):
+    """读取应用设置，不存在返回 default"""
+    row = query_one('SELECT value FROM app_settings WHERE key = ?', (key,))
+    return row['value'] if row else default
+
+
+def set_setting(key, value):
+    """保存应用设置（UPSERT）"""
+    execute('INSERT INTO app_settings (key, value) VALUES (?,?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (key, value))

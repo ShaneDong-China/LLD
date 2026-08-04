@@ -162,28 +162,32 @@ if __name__ == '__main__':
             return
         data = f.getvalue()
         try:
-            models, skipped, undefined = te.preview_templates(BytesIO(data))
+            result = te.classify_templates(BytesIO(data))
         except Exception as e:
             st.error(f'文件解析失败: {e}')
             return
-        if not models:
+        if not result['importable'] and not result['skipped']:
             st.error('未解析到任何模板数据，请确认文件符合模板库格式（sheet 名 = 型号，第一行含「接口」表头）')
             return
-        for m in undefined:
-            st.warning(f'sheet「{m}」在「模板信息」表中未定义，导入时将跳过（需先在信息表添加对应型号行）')
-        port_total = sum(models.values())
-        new_models = [m for m in models if not tu.get_template_by_model(m)]
-        exist_models = [m for m in models if tu.get_template_by_model(m)]
-        st.success(f"解析到 **{len(models)}** 个型号、共 **{port_total}** 个端口")
-        if exist_models:
-            st.caption(f"已存在将跳过: {', '.join(exist_models)}")
-        if skipped:
-            st.caption(f"跳过 sheet: {', '.join(str(s) for s in skipped)}")
-        if st.button('确认导入', type='primary', width='stretch'):
-            result = te.import_templates(BytesIO(data))
-            msg = f"导入完成：新增模板 **{len(result['created'])}** 个、端口 **{result['port_count']}** 个"
-            if result['skipped']:
-                msg += f"；跳过 {len(result['skipped'])} 个（已存在）"
+        # 分组显示：可以导入 / 跳过（含原因）
+        if result['importable']:
+            with st.container(border=True):
+                st.success(f'✅ 可以导入（{len(result["importable"])} 个）')
+                st.dataframe(
+                    [{'型号': t['model'], '端口数': len(t['ports'])} for t in result['importable']],
+                    hide_index=True, width='stretch')
+        if result['skipped']:
+            with st.container(border=True):
+                st.warning(f'⏭ 跳过（{len(result["skipped"])} 个）')
+                st.dataframe(
+                    [{'名称': s['name'], '原因': s['reason']} for s in result['skipped']],
+                    hide_index=True, width='stretch')
+        if st.button('确认导入', type='primary', width='stretch',
+                     disabled=not result['importable']):
+            done = te.import_templates(BytesIO(data))
+            msg = f"导入完成：新增模板 **{len(done['created'])}** 个、端口 **{done['port_count']}** 个"
+            if done['skipped']:
+                msg += f"；跳过 {len(done['skipped'])} 个"
             st.session_state['flash'] = ('success', msg)
             st.rerun()
 
